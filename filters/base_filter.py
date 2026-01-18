@@ -6,12 +6,11 @@ class BaseFilter(ABC):
     Todas las subclases deben implementar el método apply.
     """
 
-    def __init__(self, frame, landmarks):
-        self.frame = frame
-        self.landmarks = landmarks
+    def __init__(self):
+        pass
 
     @abstractmethod
-    def apply(self):
+    def apply(self, frame, landmarks):
         """
         Método que aplica el filtro sobre el frame.
         Debe implementarse en cada filtro específico.
