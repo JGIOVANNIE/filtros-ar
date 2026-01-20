@@ -28,7 +28,8 @@ class Shield3DFilter(BaseFilter):
         cx = int(nose.x * w)
         cy = int(nose.y * h)
 
-        verts = self.vertices * self.scale
+        verts_scaled = (self.verts + self.offset_3d) * scale
+
         projected = self.project(verts, cx, cy, scale=100)
 
         # Dibujar puntos

@@ -1,36 +1,63 @@
 import cv2
 
+
 class CameraManager:
     """
-    Clase para manejar la cámara en tiempo real.
-    Permite abrir la cámara, capturar frames y liberarla correctamente.
+    Maneja la cámara de forma robusta para proyectos AR.
     """
 
-    def __init__(self, camera_index=0):
-        """
-        Inicializa la cámara.
-        :param camera_index: ID de la cámara (0 por defecto = webcam principal)
-        """
-        # Crea un objeto de captura de video con OpenCV
-        self.cap = cv2.VideoCapture(camera_index)
+    def __init__(self, camera_index=0, width=640, height=480):
+        self.camera_index = camera_index
+        self.width = width
+        self.height = height
+        self.cap = self._open_camera()
 
+    # --------------------------------------------------
+    # Apertura segura de cámara
+    # --------------------------------------------------
+    def _open_camera(self):
+        """
+        Intenta abrir la cámara con distintos backends (Windows friendly).
+        """
+        backends = [
+            cv2.CAP_DSHOW,
+            cv2.CAP_MSMF,
+            cv2.CAP_ANY
+        ]
+
+        for backend in backends:
+            cap = cv2.VideoCapture(self.camera_index, backend)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                print(f"[INFO] Cámara abierta con backend {backend}")
+                return cap
+
+        raise RuntimeError("❌ No se pudo abrir la cámara")
+
+    # --------------------------------------------------
+    # Captura de frame
+    # --------------------------------------------------
     def get_frame(self):
         """
-        Captura un frame de la cámara.
-        Devuelve el frame espejeado para una experiencia tipo espejo.
-        :return: frame (imagen BGR) o None si falla la captura
+        Captura un frame espejeado.
         """
-        ret, frame = self.cap.read()  # Intenta leer un nuevo cuadro
+        if not self.cap or not self.cap.isOpened():
+            return None
+
+        ret, frame = self.cap.read()
         if not ret:
             return None
 
-        # Espejea horizontalmente para que se vea como un espejo
-        frame = cv2.flip(frame, 1)
-        return frame
+        return cv2.flip(frame, 1)
 
+    # --------------------------------------------------
+    # Liberar recursos
+    # --------------------------------------------------
     def release(self):
         """
-        Libera la cámara y destruye todas las ventanas de OpenCV.
+        Libera cámara y ventanas.
         """
-        self.cap.release()          # Libera el acceso a la cámara
-        cv2.destroyAllWindows()     # Cierra todas las ventanas creadas por OpenCV
+        if self.cap:
+            self.cap.release()
+        cv2.destroyAllWindows()

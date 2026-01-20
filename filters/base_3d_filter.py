@@ -1,131 +1,180 @@
 import cv2
 import numpy as np
 import trimesh
-from filters.base_filter import BaseFilter
 
-MP_IDXS = [33, 263, 1, 61, 291, 199]
+# --------------------------
+# Puntos MediaPipe para pose
+# --------------------------
+MP_IDXS = [
+    1,     # nariz
+    33,    # ojo izquierdo
+    263,   # ojo derecho
+    234,   # sien izquierda
+    454,   # sien derecha
+    152    # mentón (nuevo punto, mínimo 6 para solvePnP)
+]
 
+# --------------------------
+# Modelo facial canónico 3D
+# --------------------------
 CANON_FACE_3D = np.array([
-    [-0.03,  0.04, -0.02],
-    [ 0.03,  0.04, -0.02],
-    [ 0.00,  0.00,  0.00],
-    [-0.02, -0.03, -0.02],
-    [ 0.02, -0.03, -0.02],
-    [ 0.00, -0.06, -0.01],
+    [0.0, 0.0, 0.0],       # nariz
+    [-0.03, 0.04, -0.02],  # ojo izq
+    [0.03, 0.04, -0.02],   # ojo der
+    [-0.06, 0.0, -0.04],   # sien izq
+    [0.06, 0.0, -0.04],    # sien der
+    [0.0, -0.06, -0.02],   # mentón
 ], dtype=np.float32)
 
-
-class Base3DFilter(BaseFilter):
-
-    def __init__(self, model_path, color=(255,170,80), alpha=0.7, scale=1.0):  # ✅
-        super().__init__()
-
-        self.color = color
+class Base3DFilter:
+    def __init__(self, model_path, alpha=0.9, scale_base=0.08, offset_3d=(0.0, 0.0, -0.02)):
         self.alpha = alpha
+        self.scale_base = scale_base
+        self.offset_3d = np.array(offset_3d, dtype=np.float32)
 
-        # Aplicar scale al cargar la malla
-        target_size = 0.12 * scale  # ✅
-        self.verts, self.faces = self.load_mesh_norm(model_path, target_size=target_size)
+        # Cargar modelo 3D
+        self.verts, self.faces, self.colors = self.load_mesh_norm(model_path, 1.0)
 
+        # Cámara
         self.K = None
-        self.dist = np.zeros((4, 1))
-        self.rvec = None
-        self.tvec = None
-        self.smoothing_factor = 0.5
+        self.dist = np.zeros((4, 1), dtype=np.float32)
 
-    # ---------- Mesh ----------
-    def load_mesh_norm(self, path, target_size=0.12):
-        mesh = trimesh.load(path, force='mesh')
+        # Suavizado
+        self.smoothing = 0.6
+        self._rvec_prev = None
+        self._tvec_prev = None
 
-        if isinstance(mesh, trimesh.Scene):
-            mesh = trimesh.util.concatenate(
-                tuple(mesh.geometry.values())
-            )
+    # --------------------------
+    # Cargar y normalizar modelo
+    # --------------------------
+    def load_mesh_norm(self, model_path, target_size):
+        mesh = trimesh.load(model_path, process=False)
+        if hasattr(mesh, "geometry"):
+            mesh = list(mesh.geometry.values())[0]
 
-        V = np.array(mesh.vertices, dtype=np.float32)
-        F = np.array(mesh.faces, dtype=np.int32)
+        verts = mesh.vertices.astype(np.float32)
+        faces = mesh.faces
+        colors = mesh.visual.vertex_colors[:, :3] if hasattr(mesh.visual, "vertex_colors") else None
 
-        V -= V.mean(axis=0)
-        size = np.linalg.norm(V.max(0) - V.min(0))
-        V *= target_size / size
+        # Normalizar
+        verts -= verts.mean(axis=0)
+        max_range = np.max(np.linalg.norm(verts, axis=1))
+        verts /= max_range
+        verts *= target_size
 
-        return V, F
+        return verts, faces, colors
 
-    # ---------- Cámara ----------
+    # --------------------------
+    # Extraer puntos 2D
+    # --------------------------
+    def extract_face_points(self, landmarks, frame_shape):
+        h, w = frame_shape[:2]
+        pts = []
+        for idx in MP_IDXS:
+            lm = landmarks.landmark[idx]
+            pts.append([lm.x * w, lm.y * h])
+        return np.array(pts, dtype=np.float32)
+
+    # --------------------------
+    # Matriz de cámara aproximada
+    # --------------------------
     def K_from_frame(self, frame):
         h, w = frame.shape[:2]
-        f = 1.0 * w
+        f = w
         return np.array([
             [f, 0, w / 2],
             [0, f, h / 2],
             [0, 0, 1]
         ], dtype=np.float32)
 
-    # ---------- MediaPipe ----------
-    def mp_to_px(self, w, h, lm, idx):
-        p = lm.landmark[idx]
-        return np.array([p.x * w, p.y * h], dtype=np.float32)
-
-    def face_points_2d(self, frame, lm):
-        h, w = frame.shape[:2]
-        return np.array(
-            [self.mp_to_px(w, h, lm, i) for i in MP_IDXS],
-            dtype=np.float32
-        )
-
-    # ---------- Suavizado ----------
+    # --------------------------
+    # Suavizado de pose
+    # --------------------------
     def smooth_pose(self, rvec, tvec):
-        if self.rvec is None or self.tvec is None:
-            self.rvec = rvec.copy()
-            self.tvec = tvec.copy()
-        else:
-            self.rvec = self.rvec * self.smoothing_factor + rvec * (1 - self.smoothing_factor)
-            self.tvec = self.tvec * self.smoothing_factor + tvec * (1 - self.smoothing_factor)
-        
-        return self.rvec, self.tvec
+        if self._rvec_prev is None:
+            self._rvec_prev = rvec
+            self._tvec_prev = tvec
+            return rvec, tvec
 
-    # ---------- Proyección ----------
-    def project(self, verts, rvec, tvec, K):
-        pts2d, _ = cv2.projectPoints(verts, rvec, tvec, K, self.dist)
-        R, _ = cv2.Rodrigues(rvec)
-        X_cam = (R @ verts.T).T + tvec.T
-        z_cam = X_cam[:, 2]
-        return pts2d.reshape(-1, 2), z_cam
+        rvec_s = self.smoothing * self._rvec_prev + (1 - self.smoothing) * rvec
+        tvec_s = self.smoothing * self._tvec_prev + (1 - self.smoothing) * tvec
 
-    # ---------- Dibujo ----------
+        self._rvec_prev = rvec_s
+        self._tvec_prev = tvec_s
+        return rvec_s, tvec_s
+
+    # --------------------------
+    # Dibujar modelo 3D sobre frame
+    # --------------------------
     def draw(self, frame, pts2d, faces, z_cam):
         overlay = frame.copy()
-        face_depths = z_cam[faces].mean(axis=1)
-        order = np.argsort(face_depths)
+        order = np.argsort(z_cam[faces].mean(axis=1))[::-1]
 
-        for idx in order:
-            poly = pts2d[faces[idx]].astype(np.int32)
-            if np.all((poly >= 0) & (poly < [frame.shape[1], frame.shape[0]])):
-                cv2.fillConvexPoly(overlay, poly, self.color)
-                cv2.polylines(overlay, [poly], True, (50, 50, 50), 1)
+        for i in order:
+            face = faces[i]
+            poly = pts2d[face].astype(np.int32)
+            if np.any(poly < 0):
+                continue
+            color = np.mean(self.colors[face], axis=0).astype(int).tolist() if self.colors is not None else (200, 200, 200)
+            cv2.fillConvexPoly(overlay, poly, color)
 
         cv2.addWeighted(overlay, self.alpha, frame, 1 - self.alpha, 0, frame)
 
-    # ---------- APPLY ----------
+    # --------------------------
+    # Aplicar filtro
+    # --------------------------
     def apply(self, frame, landmarks):
-        img_pts = self.face_points_2d(frame, landmarks)
+        if landmarks is None:
+            return frame
+
+        img_pts = self.extract_face_points(landmarks, frame.shape)
+        if img_pts.shape[0] != len(CANON_FACE_3D):
+            return frame
 
         if self.K is None:
             self.K = self.K_from_frame(frame)
 
+        # Pose estimation
         ok, rvec, tvec = cv2.solvePnP(
-            CANON_FACE_3D, 
-            img_pts, 
-            self.K, 
+            CANON_FACE_3D,
+            img_pts,
+            self.K,
             self.dist,
             flags=cv2.SOLVEPNP_ITERATIVE
         )
-
         if not ok:
             return frame
 
         rvec, tvec = self.smooth_pose(rvec, tvec)
-        pts2d, z_cam = self.project(self.verts, rvec, tvec, self.K)
+
+        # Escala proporcional a la cabeza
+        left = landmarks.landmark[234]
+        right = landmarks.landmark[454]
+        face_width_px = np.linalg.norm(
+            np.array([left.x * frame.shape[1], left.y * frame.shape[0]]) -
+            np.array([right.x * frame.shape[1], right.y * frame.shape[0]])
+        )
+
+        scale = 2 * (face_width_px / frame.shape[1])  # ajustar scale_base
+
+        verts_scaled = (self.verts + self.offset_3d) * scale
+
+        # Centrar el modelo en la cabeza
+        tvec[0] = 0.0
+        tvec[1] = 0.0
+        tvec[2] = 0.15
+        # Proyección 3D -> 2D
+        pts2d, _ = cv2.projectPoints(
+            verts_scaled,
+            rvec,
+            tvec,
+            self.K,
+            self.dist
+        )
+        pts2d = pts2d.reshape(-1, 2)
+        z_cam = verts_scaled[:, 2] + tvec[2]
+
+        # Dibujar modelo
         self.draw(frame, pts2d, self.faces, z_cam)
 
         return frame
